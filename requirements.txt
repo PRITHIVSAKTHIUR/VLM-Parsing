@@ -1,7 +1,7 @@
+git+https://github.com/huggingface/transformers.git@v4.57.1
 git+https://github.com/huggingface/accelerate.git
 git+https://github.com/huggingface/peft.git
 transformers-stream-generator
-gradio_pdf==0.0.22
 huggingface_hub
 albumentations
 beautifulsoup4
@@ -9,16 +9,18 @@ qwen-vl-utils
 pyvips-binary
 sentencepiece
 opencv-python
-transformers
 docling-core
 python-docx
 torchvision
+gradio_pdf
 matplotlib
+tokenizers
 pdf2image
 num2words
 reportlab
 html2text
-xformers
+easydict
+protobuf
 markdown
 requests
 pymupdf
@@ -27,6 +29,7 @@ hf_xet
 spaces
 pyvips
 pillow
+addict 
 gradio
 einops
 httpx
