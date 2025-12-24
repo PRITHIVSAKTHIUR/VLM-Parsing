@@ -1,9 +1,8 @@
 import os
-import hashlib
-import spaces
-import re
+import sys
+from typing import Iterable, Optional, Tuple, Dict, Any, List
 import time
-import click
+import spaces
 import gradio as gr
 from io import BytesIO
 from PIL import Image
@@ -11,12 +10,67 @@ from loguru import logger
 from pathlib import Path
 import torch
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
-from transformers.image_utils import load_image
-import fitz
+import fitz  # PyMuPDF
 import html2text
 import markdown
 import tempfile
-from typing import Optional, Tuple, Dict, Any, List
+
+from gradio.themes import Soft
+from gradio.themes.utils import colors, fonts, sizes
+
+# --- Theme and CSS Definition ---
+
+colors.steel_blue = colors.Color(
+    name="steel_blue",
+    c50="#EBF3F8", c100="#D3E5F0", c200="#A8CCE1", c300="#7DB3D2",
+    c400="#529AC3", c500="#4682B4", c600="#3E72A0", c700="#36638C",
+    c800="#2E5378", c900="#264364", c950="#1E3450",
+)
+
+class SteelBlueTheme(Soft):
+    def __init__(
+        self,
+        *,
+        primary_hue: colors.Color | str = colors.gray,
+        secondary_hue: colors.Color | str = colors.steel_blue,
+        neutral_hue: colors.Color | str = colors.slate,
+        text_size: sizes.Size | str = sizes.text_lg,
+        font: fonts.Font | str | Iterable[fonts.Font | str] = (
+            fonts.GoogleFont("Outfit"), "Arial", "sans-serif",
+        ),
+        font_mono: fonts.Font | str | Iterable[fonts.Font | str] = (
+            fonts.GoogleFont("IBM Plex Mono"), "ui-monospace", "monospace",
+        ),
+    ):
+        super().__init__(
+            primary_hue=primary_hue, secondary_hue=secondary_hue, neutral_hue=neutral_hue,
+            text_size=text_size, font=font, font_mono=font_mono,
+        )
+        super().set(
+            background_fill_primary="*primary_50",
+            background_fill_primary_dark="*primary_900",
+            body_background_fill="linear-gradient(135deg, *primary_200, *primary_100)",
+            body_background_fill_dark="linear-gradient(135deg, *primary_900, *primary_800)",
+            button_primary_text_color="white",
+            button_primary_text_color_hover="white",
+            button_primary_background_fill="linear-gradient(90deg, *secondary_500, *secondary_600)",
+            button_primary_background_fill_hover="linear-gradient(90deg, *secondary_600, *secondary_700)",
+            button_primary_background_fill_dark="linear-gradient(90deg, *secondary_600, *secondary_700)",
+            button_primary_background_fill_hover_dark="linear-gradient(90deg, *secondary_500, *secondary_600)",
+            slider_color="*secondary_500",
+            slider_color_dark="*secondary_600",
+            block_title_text_weight="600",
+            block_border_width="3px",
+            block_shadow="*shadow_drop_lg",
+            button_primary_shadow="*shadow_drop_lg",
+            button_large_padding="11px",
+            color_accent_soft="*primary_100",
+            block_label_background_fill="*primary_200",
+        )
+
+steel_blue_theme = SteelBlueTheme()
+
+# --- Model and App Logic ---
 
 pdf_suffixes = [".pdf"]
 image_suffixes = [".png", ".jpeg", ".jpg"]
@@ -59,9 +113,6 @@ logger.info(f"Model '{MODEL_ID_3}' loaded successfully.")
 
 @spaces.GPU
 def parse_page(image: Image.Image, model_name: str) -> str:
-    """
-    Parses a single document page image using the selected model.
-    """
     if model_name == "Logics-Parsing":
         current_processor, current_model = processor_1, model_1
     elif model_name == "Gliese-OCR-7B-Post1.0":
@@ -71,21 +122,20 @@ def parse_page(image: Image.Image, model_name: str) -> str:
     else:
         raise ValueError(f"Unknown model choice: {model_name}")
 
-    messages = [{"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": "Parse this document page into a clean, structured HTML representation. Preserve the logical structure with appropriate tags for content blocks such as paragraphs (<p>), headings (<h1>-<h6>), tables (<table>), figures (<figure>), formulas (<formula>), and others. Include category tags, and filter out irrelevant elements like headers and footers."}]}]
+    # Standard Qwen2-VL format
+    messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Parse this document page into a clean, structured HTML representation. Preserve the logical structure with appropriate tags for content blocks such as paragraphs (<p>), headings (<h1>-<h6>), tables (<table>), figures (<figure>), formulas (<formula>), and others. Include category tags, and filter out irrelevant elements like headers and footers."}]}]
+    
     prompt_full = current_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = current_processor(text=[prompt_full], images=[image], return_tensors="pt", padding=True).to(device)
+    inputs = current_processor(text=prompt_full, images=[image.convert("RGB")], return_tensors="pt").to(device)
 
     with torch.no_grad():
-        generated_ids = current_model.generate(**inputs, max_new_tokens=2048, temperature=0.1, top_p=0.9, do_sample=True, repetition_penalty=1.05)
+        generated_ids = current_model.generate(**inputs, max_new_tokens=2048, do_sample=False)
     
-    generated_ids_trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
-    output_text = current_processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+    generated_ids = generated_ids[:, inputs['input_ids'].shape[1]:]
+    output_text = current_processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
     return output_text
 
 def convert_file_to_images(file_path: str, dpi: int = 200) -> List[Image.Image]:
-    """
-    Converts a PDF or image file into a list of PIL Images.
-    """
     images = []
     file_ext = Path(file_path).suffix.lower()
     
@@ -104,7 +154,7 @@ def convert_file_to_images(file_path: str, dpi: int = 200) -> List[Image.Image]:
             page = pdf_document.load_page(page_num)
             pix = page.get_pixmap(matrix=mat)
             img_data = pix.tobytes("png")
-            images.append(Image.open(BytesIO(img_data)))
+            images.append(Image.open(BytesIO(img_data)).convert("RGB"))
         pdf_document.close()
     except Exception as e:
         logger.error(f"Failed to convert PDF using PyMuPDF: {e}")
@@ -112,13 +162,9 @@ def convert_file_to_images(file_path: str, dpi: int = 200) -> List[Image.Image]:
     return images
 
 def get_initial_state() -> Dict[str, Any]:
-    """Returns the default initial state for the application."""
     return {"pages": [], "total_pages": 0, "current_page_index": 0, "page_results": []}
 
 def load_and_preview_file(file_path: Optional[str]) -> Tuple[Optional[Image.Image], str, Dict[str, Any]]:
-    """
-    Loads a file, converts all pages to images, and stores them in the state.
-    """
     state = get_initial_state()
     if not file_path:
         return None, '<div class="page-info">No file loaded</div>', state
@@ -136,10 +182,7 @@ def load_and_preview_file(file_path: Optional[str]) -> Tuple[Optional[Image.Imag
         logger.error(f"Failed to load and preview file: {e}")
         return None, '<div class="page-info">Failed to load preview</div>', state
 
-async def process_all_pages(state: Dict[str, Any], model_choice: str):
-    """
-    Processes all pages stored in the state and updates the state with results.
-    """
+async def process_all_pages(state: Dict[str, Any], model_choice: str, progress=gr.Progress(track_tqdm=True)):
     if not state or not state["pages"]:
         error_msg = "<h3>Please upload a file first.</h3>"
         return error_msg, "", "", None, "Error: No file to process", state
@@ -149,14 +192,12 @@ async def process_all_pages(state: Dict[str, Any], model_choice: str):
     
     try:
         page_results = []
-        for i, page_img in enumerate(state["pages"]):
-            logger.info(f"Parsing page {i + 1}/{state['total_pages']}")
+        for i, page_img in progress.tqdm(enumerate(state["pages"]), desc="Processing Pages"):
             html_result = parse_page(page_img, model_choice)
             page_results.append({'raw_html': html_result})
         
         state["page_results"] = page_results
         
-        # Create a single markdown file for download with all content
         full_html_content = "\n\n".join([f'<!-- Page {i+1} -->\n{res["raw_html"]}' for i, res in enumerate(page_results)])
         full_markdown = html2text.html2text(full_html_content)
         with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False, encoding='utf-8') as f:
@@ -166,7 +207,6 @@ async def process_all_pages(state: Dict[str, Any], model_choice: str):
         parsing_time = time.time() - start_time
         cost_time_str = f'Total processing time: {parsing_time:.2f}s'
         
-        # Display the results for the current page
         current_page_results = get_page_outputs(state)
         
         return *current_page_results, md_path, cost_time_str, state
@@ -177,9 +217,6 @@ async def process_all_pages(state: Dict[str, Any], model_choice: str):
         return error_html, "", "", None, f"Error: {str(e)}", state
 
 def navigate_page(direction: str, state: Dict[str, Any]):
-    """
-    Navigates to the previous or next page and updates the UI accordingly.
-    """
     if not state or not state["pages"]:
         return None, '<div class="page-info">No file loaded</div>', *get_page_outputs(state), state
 
@@ -203,129 +240,89 @@ def navigate_page(direction: str, state: Dict[str, Any]):
     return image_preview, page_info_html, *page_outputs, state
 
 def get_page_outputs(state: Dict[str, Any]) -> Tuple[str, str, str]:
-    """Helper to get displayable outputs for the current page."""
     if not state or not state.get("page_results"):
         return "<h3>Process the document to see results.</h3>", "", ""
 
     index = state["current_page_index"]
+    if index >= len(state["page_results"]):
+        return "<h3>Result not available for this page.</h3>", "", ""
+        
     result = state["page_results"][index]
     raw_html = result['raw_html']
     
-    mmd_source = html2text.html2text(raw_html)
-    mmd_render = markdown.markdown(mmd_source, extensions=['fenced_code', 'tables'])
+    md_source = html2text.html2text(raw_html)
+    md_render = markdown.markdown(md_source, extensions=['fenced_code', 'tables'])
     
-    return mmd_render, mmd_source, raw_html
+    return md_render, md_source, raw_html
 
 def clear_all():
-    """Clears all UI components and resets the state."""
-    return (
-        None,
-        None,
-        "<h3>Results will be displayed here after processing.</h3>",
-        "",
-        "",
-        None,
-        "",
-        '<div class="page-info">No file loaded</div>',
-        get_initial_state()
-    )
+    return None, None, "<h3>Results will be displayed here after processing.</h3>", "", "", None, "", '<div class="page-info">No file loaded</div>', get_initial_state()
 
-@click.command()
-def main():
-    """
-    Sets up and launches the Gradio user interface for the Logics-Parsing app.
-    """
-    css = """
-    .main-container { max-width: 1400px; margin: 0 auto; }
-    .header-text { text-align: center; color: #2c3e50; margin-bottom: 20px; }
-    .process-button { border: none !important; color: white !important; font-weight: bold !important; background-color: blue !important;}
-    .process-button:hover { background-color: darkblue !important; transform: translateY(-2px) !important; box-shadow: 0 4px 8px rgba(0,0,0,0.2) !important; }
-    .page-info { text-align: center; padding: 8px 16px; border-radius: 20px; font-weight: bold; margin: 10px 0; }
-    """
-    with gr.Blocks(theme="bethecloud/storj_theme", css=css, title="Logics-Parsing Demo") as demo:
-        app_state = gr.State(value=get_initial_state())
+css = """
+.main-container { max-width: 1400px; margin: 0 auto; }
+.header-text { text-align: center; margin-bottom: 20px; }
+.page-info { text-align: center; padding: 8px 16px; font-weight: bold; margin: 10px 0; }
+"""
 
-        gr.HTML("""
-        <div class="header-text">
-            <h1>📄 Multimodal: VLM Parsing</h1>
-            <p style="font-size: 1.1em; color: #6b7280;">An advanced Vision Language Model to parse documents and images into clean Markdown(.md)</p>
-            <div style="display: flex; justify-content: center; gap: 20px; margin: 15px 0;">
-                <a href="https://huggingface.co/collections/prithivMLmods/mm-vlm-parsing-68e33e52bfb9ae60b50602dc" target="_blank" style="text-decoration: none; color: #2563eb; font-weight: 500;">🤗 Model Info</a>
-                <a href="https://github.com/PRITHIVSAKTHIUR/VLM-Parsing" target="_blank" style="text-decoration: none; color: #2563eb; font-weight: 500;">💻 GitHub</a>
-                <a href="https://huggingface.co/models?pipeline_tag=image-text-to-text&sort=trending" target="_blank" style="text-decoration: none; color: #2563eb; font-weight: 500;">📝 Multimodal VLMs</a>
-            </div>
+with gr.Blocks() as demo:
+    app_state = gr.State(value=get_initial_state())
+
+    gr.HTML("""
+    <div class="header-text">
+        <h1>📄 Multimodal: VLM Parsing</h1>
+        <p style="font-size: 1.1em;">An advanced Vision Language Model to parse documents and images into clean Markdown (html)</p>
+        <div style="display: flex; justify-content: center; gap: 20px; margin: 15px 0;">
+            <a href="https://huggingface.co/collections/prithivMLmods/mm-vlm-parsing-68e33e52bfb9ae60b50602dc" target="_blank" style="text-decoration: none; font-weight: 500;">🤗 Model Info</a>
+            <a href="https://github.com/PRITHIVSAKTHIUR/VLM-Parsing" target="_blank" style="text-decoration: none; font-weight: 500;">💻 GitHub</a>
+            <a href="https://huggingface.co/models?pipeline_tag=image-text-to-text&sort=trending" target="_blank" style="text-decoration: none; font-weight: 500;">📝 Multimodal VLMs</a>
         </div>
-        """)
+    </div>
+    """)
 
-        with gr.Row(elem_classes=["main-container"]):
-            with gr.Column(scale=1):
-                model_choice = gr.Dropdown(choices=["Logics-Parsing", "Gliese-OCR-7B-Post1.0", "olmOCR-7B-0825"], label="Select Model⚡️", value="Logics-Parsing")
-                file_input = gr.File(label="Upload PDF or Image", file_types=[".pdf", ".jpg", ".jpeg", ".png"], type="filepath")
-                image_preview = gr.Image(label="Preview", type="pil", interactive=False, height=280)
-                
-                with gr.Row():
-                    prev_page_btn = gr.Button("◀ Previous", size="md")
-                    page_info = gr.HTML('<div class="page-info">No file loaded</div>')
-                    next_page_btn = gr.Button("Next ▶", size="md")
+    with gr.Row(elem_classes=["main-container"]):
+        with gr.Column(scale=1):
+            model_choice = gr.Dropdown(choices=["Logics-Parsing", "Gliese-OCR-7B-Post1.0", "olmOCR-7B-0825"], label="Select Model", value="Logics-Parsing")
+            file_input = gr.File(label="Upload PDF or Image", file_types=[".pdf", ".jpg", ".jpeg", ".png"], type="filepath")
+                    
+            image_preview = gr.Image(label="Preview", type="pil", interactive=False, height=320)
+            
+            with gr.Row():
+                prev_page_btn = gr.Button("◀ Previous")
+                page_info = gr.HTML('<div class="page-info">No file loaded</div>')
+                next_page_btn = gr.Button("Next ▶")
 
-                example_root = "examples"
-                if os.path.exists(example_root) and os.path.isdir(example_root):
-                    example_files = [os.path.join(example_root, f) for f in os.listdir(example_root) if f.endswith(tuple(pdf_suffixes + image_suffixes))]
-                    if example_files:
-                        #with gr.Accordion("Open Examples⚙️", open=False):
-                        #with gr.row():
-                        gr.Examples(examples=example_files, inputs=file_input, examples_per_page=10)
+            with gr.Accordion("Download & Details", open=False):
+                output_file = gr.File(label='Download Markdown Result', interactive=False)
+                cost_time = gr.Textbox(label='Time Cost', interactive=False)
 
-                with gr.Accordion("Download Details🕧", open=False):
-                    output_file = gr.File(label='Download Markdown Result', interactive=False)
-                    cost_time = gr.Text(label='Time Cost', interactive=False)
+            example_root = "examples"
+            if os.path.exists(example_root) and os.path.isdir(example_root):
+                example_files = [os.path.join(example_root, f) for f in os.listdir(example_root) if f.endswith(tuple(pdf_suffixes + image_suffixes))]
+                if example_files:
+                    gr.Examples(examples=example_files, inputs=file_input, label="Examples")
 
-                process_btn = gr.Button("🚀 Process", variant="primary", elem_classes=["process-button"], size="lg")
-                clear_btn = gr.Button("🗑️ Clear All", variant="secondary")
-
-            with gr.Column(scale=2):
-                with gr.Tabs():
-                    with gr.Tab("Markdown Rendering"):
-                        mmd_html = gr.TextArea(lines=27, label='Markdown Rendering', show_copy_button=True, interactive=True)
-                    with gr.Tab("Markdown Source"):
-                        mmd = gr.TextArea(lines=27, show_copy_button=True, label="Markdown Source", interactive=True)
-                    with gr.Tab("Generated HTML"):
-                        raw_html = gr.TextArea(lines=27, show_copy_button=True, label="Generated HTML")
-
-        # --- Event Handlers ---
-        file_input.change(
-            fn=load_and_preview_file, 
-            inputs=file_input, 
-            outputs=[image_preview, page_info, app_state],
-            show_progress="full")
+            process_btn = gr.Button("🚀 Process Document", variant="primary", size="lg")
+            clear_btn = gr.Button("🗑️ Clear All", variant="secondary")
         
-        process_btn.click(
-            fn=process_all_pages, 
-            inputs=[app_state, model_choice], 
-            outputs=[mmd_html, mmd, raw_html, 
-            output_file, cost_time, app_state], 
-            concurrency_limit=15, 
-            show_progress="full")
+        with gr.Column(scale=2):
+            with gr.Tabs():
+                with gr.Tab("Markdown Source"):
+                    md_source_output = gr.Code(language="markdown", label="Markdown Source")
+                with gr.Tab("Rendered Markdown"):
+                    md_render_output = gr.Markdown(label='Markdown Rendering')                        
+                with gr.Tab("Generated HTML"):
+                    raw_html_output = gr.Code(language="html", label="Generated HTML")
 
-        prev_page_btn.click(
-            fn=lambda s: navigate_page("prev", s), 
-            inputs=app_state, outputs=[image_preview, 
-            page_info, mmd_html, mmd, raw_html, app_state])
-        
-        next_page_btn.click(
-            fn=lambda s: navigate_page("next", s), 
-            inputs=app_state, outputs=[image_preview, 
-            page_info, mmd_html, mmd, raw_html, app_state])
+    file_input.change(fn=load_and_preview_file, inputs=file_input, outputs=[image_preview, page_info, app_state], show_progress="full")
+    
+    process_btn.click(fn=process_all_pages, inputs=[app_state, model_choice], outputs=[md_render_output, md_source_output, raw_html_output, output_file, cost_time, app_state], show_progress="full")
 
-        clear_btn.click(
-            fn=clear_all, 
-            outputs=[file_input, image_preview, mmd_html, mmd, raw_html, 
-                     output_file, cost_time, page_info, app_state])
-        
-    demo.queue().launch(debug=True, share=True, mcp_server=True, ssr_mode=False, show_error=True)
+    prev_page_btn.click(fn=lambda s: navigate_page("prev", s), inputs=app_state, outputs=[image_preview, page_info, md_render_output, md_source_output, raw_html_output, app_state])
+    
+    next_page_btn.click(fn=lambda s: navigate_page("next", s), inputs=app_state, outputs=[image_preview, page_info, md_render_output, md_source_output, raw_html_output, app_state])
 
-if __name__ == '__main__':
-    if not os.path.exists("examples"):
-        os.makedirs("examples")
-        logger.info("Created 'examples' directory. Please add some sample PDF/image files there.")
-    main()
+    clear_btn.click(fn=clear_all, outputs=[file_input, image_preview, md_render_output, md_source_output, raw_html_output, output_file, cost_time, page_info, app_state])
+
+if __name__ == '__main__':    
+    demo.queue()
+    demo.launch(theme=steel_blue_theme, css=css, mcp_server=True, ssr_mode=False, show_error=True)
